@@ -10,6 +10,7 @@ from collections import namedtuple
 from collections import deque
 from numpy.random import default_rng
 from config_GP import configGP
+from timer import timer
 
 
 class Env_base():
@@ -34,6 +35,7 @@ class Env_base():
         self.no_controls = no_controls
         self.time_step = 0
         self.dt = tf/steps
+        
     
     def model(self, t, state, control):
         params = self.parameters
@@ -96,11 +98,12 @@ class GP_agent():
     def __init__(self, env, dims_input):
         self.env = env
         self.dims_input = dims_input
-        self.kernel = GPy.kern.RBF(dims_input + self.env.no_controls, variance=1., lengthscale=1., ARD=True)
+        self.kernel = GPy.kern.RBF(dims_input + self.env.no_controls, variance=1., lengthscale=None, ARD=True)
         self.inputs = []
         self.outputs = []
         self.valid_results = []
         self.core = None
+        self.variance_con = None
     
     def normalize_x(self, X):
         "Normalize X for the GPs"
@@ -109,15 +112,15 @@ class GP_agent():
             if len(self.inputs) == 1:
                 return np.zeros_like(X, dtype=np.float64)
             else:
-                print(self.inputs)
-                print(X)
-                print(np.mean(self.inputs, axis=0))
-                print(np.std(self.inputs, axis=0))
-                print(X - np.mean(self.inputs, axis=0))
+                #print(self.inputs)
+                #print(X)
+                #print(np.mean(self.inputs, axis=0))
+                #print(np.std(self.inputs, axis=0))
+                #print(X - np.mean(self.inputs, axis=0))
                 X = (X - np.mean(self.inputs, axis=0)) / np.std(self.inputs, axis=0)
-                print(X)
+                #print(X)
                 X[np.isnan(X)] = 0
-                print(X)
+                #print(X)
         except AssertionError as error:
             print(error)
         return X
@@ -129,15 +132,15 @@ class GP_agent():
             if len(self.outputs) == 1:
                 return np.zeros_like(Y, dtype=np.float64)
             else:
-                print(self.outputs)
-                print(Y)
-                print(np.mean(self.outputs, axis=0))
-                print(np.std(self.outputs, axis=0))
-                print(Y - np.mean(self.outputs, axis=0))
+                #print(self.outputs)
+                #print(Y)
+                #print(np.mean(self.outputs, axis=0))
+                #print(np.std(self.outputs, axis=0))
+                #print(Y - np.mean(self.outputs, axis=0))
                 Y = (Y - np.mean(self.outputs, axis=0)) / np.std(self.outputs, axis=0)
-                print(Y)
+                #print(Y)
                 Y[np.isnan(Y)] = 0
-                print(Y)
+                #print(Y)
         except AssertionError as error:
             print(error)
         return Y
@@ -146,7 +149,8 @@ class GP_agent():
         #print(self.dims_input, self.env.no_controls)
         X = np.array(self.inputs).reshape(-1, self.dims_input + self.env.no_controls)
         Y = np.array(self.outputs).reshape(-1, 1)
-        X, Y = self.normalize_x(X), self.normalize_y(Y)            #only normalize to init the model
+        X = self.normalize_x(X)
+        #Y = self.normalize_y(Y)            #only normalize to init the model
         self.core = GPy.models.GPRegression(X, Y, self.kernel)     #building/updating the GP
         return self.core
         
@@ -181,8 +185,9 @@ class GP_agent():
         "since 20.03) normalized"
         if isinstance(Y, np.ndarray):
             Y = Y.item()
+        if np.isnan(Y):
+            Y = 0
         self.outputs.append(Y)
-
     def get_outputs(self):
         return self.outputs
 
@@ -284,6 +289,7 @@ class experiment():
             sol = - self.optimizer_control(model, con_model, state, con_model2).fun #-- To be used with scipy
             if sol < f_max:
                 f_max = sol
+        print(model.variance_con)
         return f_max
 
     
@@ -296,17 +302,16 @@ class experiment():
             q, q_var = model.core.predict(point)
             pen, pen_var = con_model.core.predict(point)
             pen = max(0, pen)
-            #print(q_var.item())
             if self.bayes:
-                UCB = -q.item() - pen_var.item() + np.sqrt(self.UCB_beta1) * pen
+                UCB = - q.item() - pen_var.item() + np.sqrt(self.UCB_beta1) * pen
             else:
                 UCB = -q.item()
         else:
-            print("X GP: {}".format(model.core.X))
-            print("Y GP: {}".format(model.core.Y))
+            #print("X GP: {}".format(model.core.X))
+            #print("Y GP: {}".format(model.core.Y))
 
-            print("X model: {}".format(model.inputs))
-            print("Y model: {}".format(model.outputs))
+            #print("X model: {}".format(model.inputs))
+            #print("Y model: {}".format(model.outputs))
 
             s_a = np.hstack((state, guess))
             point = np.reshape(s_a, (1,-1))
@@ -318,19 +323,20 @@ class experiment():
             #print(q[0])
             #if q[0] != 0:
             #    print(q[0]) 
-            print("q", (q,q_var))
+            #print("q", (q,q_var))
             pen1, pen_var1 = con_model.core.predict(point)      #pen1: Temperature constraint
-            print("pen1",(pen1, pen_var1))
+            #print("pen1",(pen1, pen_var1))
+            model.variance_con = pen_var1
             pen2, pen_var2 = con_model2.core.predict(point)      #pen2: Volume constraint
-            print("pen2", (pen2, pen_var2))
+            #print("pen2", (pen2, pen_var2))
             pen1 = max(0, pen1)
             pen2 = max(0, pen2)
-            #print(q_var.item())
+            alpha = 0.5
             if self.bayes:
-                UCB = -q.item() - pen_var1.item() + (self.UCB_beta1) * pen1 \
+                UCB = -q.item() * alpha - pen_var1.item() + (self.UCB_beta1) * pen1 \
                     + np.sqrt(self.UCB_beta2) * pen2 
             else:
-                UCB = -q.item()
+                UCB = -q.item() 
 
             # print q values with and without constraits
             # debbug line by line
@@ -371,7 +377,7 @@ class experiment():
             self.models[i].add_input(state, action)    #add new training inputs
             self.models[i].add_output(Y)               #add new training output
             m = self.models[i].update()                #fit GPregression
-            m.optimize(messages=False)
+            m.optimize(max_f_eval = self.config.max_eval, messages=False)
             m.optimize_restarts(self.config.no_restarts)
             state = ns
         return
@@ -465,17 +471,17 @@ class experiment():
         
         m = self.models[-1].update()                    #re-fit GPregression
         self.models[-1].constrain_lenghtsc()
-        m.optimize(messages=False)                      #constrain lengtscale
+        m.optimize(max_f_eval = self.config.max_eval, messages=False)                      #constrain lengtscale
         m.optimize_restarts(self.config.no_restarts)
         
         con_m = self.con_models[-1].update()            #re-fit constraints-keeeper model
         self.con_models[-1].constrain_lenghtsc()        #constrain lengtscale
-        con_m.optimize(messages=False)
+        con_m.optimize(max_f_eval = self.config.max_eval, messages=False)
         con_m.optimize_restarts(self.config.no_restarts)
 
         con_m2 = self.con_models2[-1].update()          #re-fit constraints-keeeper model
         self.con_models2[-1].constrain_lenghtsc()       #constrain lengtscale
-        con_m2.optimize(messages=False)
+        con_m2.optimize(max_f_eval = self.config.max_eval, messages=False)
         con_m2.optimize_restarts(self.config.no_restarts)
 
         
@@ -505,17 +511,17 @@ class experiment():
 
             m = self.models[i].update()                 #fit GPregression
             self.models[i].constrain_lenghtsc()
-            m.optimize(messages=False)
+            m.optimize(max_f_eval = self.config.max_eval, messages=False)
             m.optimize_restarts(self.config.no_restarts)
 
             con_m = self.con_models[i].update()         #re-fit constraints-keeeper model
             self.con_models[i].constrain_lenghtsc()
-            con_m.optimize(messages=False)
+            con_m.optimize(max_f_eval = self.config.max_eval, messages=False)
             con_m.optimize_restarts(self.config.no_restarts)
 
             con_m2 = self.con_models2[i].update()            #re-fit constraints-keeeper model
             self.con_models2[i].constrain_lenghtsc()
-            con_m2.optimize(messages=False)
+            con_m2.optimize(max_f_eval = self.config.max_eval, messages=False)
             con_m2.optimize_restarts(self.config.no_restarts)
 
 
@@ -562,6 +568,8 @@ class experiment():
     def violation2(self, state):
         Vcon_index = 4
         violation = (max(0, self.ns_history[-1][Vcon_index] - 800)) * (420/800)
+        if violation > 0:
+            violation *= 3
         return violation
 
     #######################################
@@ -585,8 +593,8 @@ class experiment():
     def violation2_prefill(self, state):
         Vcon_index = 4
         violation = (max(state[Vcon_index] - 800, 0)) * (420/800)
-        #if violation > 0:
-        #    violation *= 3
+        if violation > 0:
+            violation *= 3
         return violation
 
 
@@ -614,23 +622,23 @@ class experiment():
                 
 
                 m = self.models[i].update()                    #refit GPregression
-                print(self.models[i].inputs)
-                print(m.X)
-                print(self.models[i].outputs)
-                print(m.Y)
+                #print(self.models[i].inputs)
+                #print(m.X)
+                #print(self.models[i].outputs)
+                #print(m.Y)
                 self.models[i].constrain_lenghtsc()            #constrain the lenghtscale (tweak this)
-                m.optimize(messages=False) #, max_f_eval = 1000)
+                m.optimize(max_f_eval = self.config.max_eval,messages=False) #, max_f_eval = 1000)
                 m.optimize_restarts(self.config.no_restarts)
 
                 con_m = self.con_models[i].update()            #re-fit constraints-keeeper model
                 self.con_models[i].constrain_lenghtsc()
-                con_m.optimize(messages=False) #, max_f_eval = 1000)
+                con_m.optimize(max_f_eval = self.config.max_eval,messages=False) #, max_f_eval = 1000)
                 con_m.optimize_restarts(self.config.no_restarts)
 
                 #if self.two_V:
                 con_m2 = self.con_models2[i].update()
                 self.con_models2[i].constrain_lenghtsc()        #constrain/fix lenghtscale 
-                con_m2.optimize(messages=False)         
+                con_m2.optimize(max_f_eval = self.config.max_eval,messages=False)         
                 con_m2.optimize_restarts(self.config.no_restarts)
 
                 state = ns
@@ -682,16 +690,24 @@ x0 = np.array([1,0,0,290,100])
 bounds = np.array([[0,270],[298,500]])
 config = configGP
 config.dims_input = x0.shape[0]
-config.training_iter = 10 #lets start with 1 iter
+config.training_iter = 30 #lets start with 1 iter
 
-            
+
+time = timer()             
 env   = Env_base(params, steps, tf, x0, bounds, config.no_controls, noisy=False)
 #agent = GP_agent(env, config.input_dim)
 agent = GP_agent
-exp   = experiment(env, agent, config, UCB_beta1=2000, UCB_beta2=100, bayes=True,\
+exp   = experiment(env, agent, config, UCB_beta1=6000, UCB_beta2=70, bayes=True,\
     disc_rew=True, two_V=True)
+
+time.start()
+
 exp.training_loop()
 exp.validation_loop()
+
+time.end()
+
+print("Done :)")
 
 
 """
