@@ -331,7 +331,7 @@ class experiment():
             #print("pen2", (pen2, pen_var2))
             pen1 = max(0, pen1)
             pen2 = max(0, pen2)
-            alpha = 1
+            alpha = 1000
             if self.bayes:
                 UCB = -q.item() * alpha - pen_var1.item() + (self.UCB_beta1) * pen1 \
                     + np.sqrt(self.UCB_beta2) * pen2 
@@ -690,15 +690,15 @@ x0 = np.array([1,0,0,290,100])
 bounds = np.array([[0,270],[298,500]])
 config = configGP
 config.dims_input = x0.shape[0]
-config.training_iter = 40 #lets start with 1 iter
+config.training_iter = 50 #lets start with 1 iter
 
 
 time = timer()             
 env   = Env_base(params, steps, tf, x0, bounds, config.no_controls, noisy=False)
 #agent = GP_agent(env, config.input_dim)
 agent = GP_agent
-exp   = experiment(env, agent, config, UCB_beta1=6000, UCB_beta2=70, bayes=True,\
-    disc_rew=True, two_V=True)
+exp   = experiment(env, agent, config, UCB_beta1= 5000, UCB_beta2=70, bayes=True,\
+    disc_rew=True, two_V=True) #beta1 was 5000
 
 time.start()
 
