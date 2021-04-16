@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import GPy
 import scipy.integrate as scp
-from scipy.optimize import minimize
+from scipy.optimize import minimize, NonlinearConstraint
 from collections import namedtuple
 from collections import deque
 from numpy.random import default_rng
@@ -147,11 +147,13 @@ class GP_agent():
 
     def update(self):
         #print(self.dims_input, self.env.no_controls)
+        #instantiate a new kernel every time the GP is updated
+        self.kernel = GPy.kern.RBF(self.dims_input + self.env.no_controls, variance=1., lengthscale=None, ARD=True)
         X = np.array(self.inputs).reshape(-1, self.dims_input + self.env.no_controls)
         Y = np.array(self.outputs).reshape(-1, 1)
         X = self.normalize_x(X)
-        #Y = self.normalize_y(Y)            #only normalize to init the model
-        self.core = GPy.models.GPRegression(X, Y, self.kernel)     #building/updating the GP
+        Y = self.normalize_y(Y)            #only normalize to init the model
+        self.core = GPy.models.GPRegression(X, Y, self.kernel, normalizer=False)       #building/updating the GP
         return self.core
         
     def add_input(self, state, action):
@@ -169,7 +171,8 @@ class GP_agent():
         return
     
     def constrain_lenghtsc(self):
-        self.core['rbf.lengthscale'].constrain_bounded(15,100)
+        #pass
+        self.core['rbf.lengthscale'].constrain_bounded(0,10)
         return 
 
     def add_val_result(self, state, action):
@@ -195,7 +198,7 @@ class GP_agent():
 
 
 class experiment():
-    def __init__(self, env, agent, config, UCB_beta1, UCB_beta2, bayes = True, disc_rew = False, two_V = False):
+    def __init__(self, env, agent, config, UCB_beta1, UCB_beta2, bayes=True, constr=False, disc_rew=False, two_V=False):
         self.env = env
         self.config = config
         self.models = []
@@ -223,9 +226,10 @@ class experiment():
         self.v2_history  = np.zeros(self.env.steps)
 
         self.UCB_beta1, self.UCB_beta2 = UCB_beta1, UCB_beta2
-        self.bayes = bayes
+        self.bayes, self.constr = bayes, constr
         self.disc_rew = disc_rew
         self.training_iter = 0
+        self.val_c = 1
 
 
     def select_action(self, state, model, con_model, con_model2 = None, pre_filling = False):
@@ -240,17 +244,27 @@ class experiment():
         assert in_bounds
         return action
 
-    def best_action(self, state, model, con_model, con_model2 = None): #arg max over actions
+    def best_action(self, state, model, con_model, con_model2 = None, validation=False): #arg max over actions
         #max_a, max_q = self.random_search(state, model)
         #return max_a
-        opt_loops = 20
+        opt_loops = 20 #trying to cut this down?
         f_max = 1e10
-        for i in range(opt_loops):
-            sol = self.optimizer_control(model, con_model, state, con_model2)#-- To be used with scipy
-            if -sol.fun < f_max:
-                f_max = -sol.fun
-            #print(-sol.fun, sol.x)
-        return sol.x #-- To be used with scipy
+        if not validation:
+            for i in range(opt_loops):
+                sol = self.optimizer_control(model, con_model, state, con_model2)#-- To be used with scipy
+                if -sol.fun < f_max:
+                    f_max = -sol.fun
+            return sol.x #-- To be used with scipy
+                #print(-sol.fun, sol.x)
+        elif validation:
+            print("Validation UCB")
+            for i in range(opt_loops):
+                self.UCB_beta1, self.UCB_beta2, self.val_c = 0, 0, 0
+                sol = self.optimizer_control(model, con_model, state, con_model2)#-- To be used with scipy
+                if -sol.fun < f_max:
+                    f_max = -sol.fun
+            return sol.x ##-- Not explored, only exploit
+            
 
     def random_action(self): #random action from the action space
         actions = np.zeros((len(self.env.bounds)))
@@ -269,12 +283,43 @@ class experiment():
         #print(q)
         return -q.item() #negative to make it maximization
 
+
     def optimizer_control(self, model, con_model, state, con_model2 = None):  #fix state, opt over actions
         action_guess = self.random_action()
         #print(action_guess)
         assert isinstance(state, np.ndarray) #state has to be ndarray
-        opt_result = minimize(self.wrapper_UCB, action_guess, args = (state, model, con_model, con_model2), bounds = self.env.bounds) #fixing states and maximizing over the actions
-                                      #The optimization here is not constrained, have to set the boundaries explicitely?
+
+        state = state
+        c_model1 = con_model
+        c_model2 = con_model2
+
+        def wrappercon1(action, state=state, c_model1=c_model1):
+            s_a = np.hstack((state, action))
+            point = np.reshape(s_a, (1,-1))
+            return c_model1.core.predict(point)[0].item() 
+
+        def wrappercon2(action, state=state, c_model2=c_model2):
+            s_a = np.hstack((state, action))
+            point = np.reshape(s_a, (1,-1))
+            return c_model2.core.predict(point)[0].item()
+
+        if self.bayes:
+            opt_result = minimize(self.wrapper_UCB, action_guess, \
+                args = (state, model, con_model, con_model2), bounds = self.env.bounds, options={"maxiter":5000}) 
+                #fixing states and maximizing over the actions
+                #The optimization here is not "constrained", have to set the constraints explicitely?
+        
+        elif self.constr:
+
+
+            con_T = NonlinearConstraint(wrappercon1, -np.inf, 0)   #need a wrapper for that method
+            con_V = NonlinearConstraint(wrappercon2, -np.inf, 0)  #will start with the "accepted" violation at 10
+
+            cons = {con_T, con_V}
+            opt_result = minimize(self.wrapper_UCB, action_guess, \
+                args = (state, model, con_model, con_model2), bounds=self.env.bounds, constraints = cons, \
+                options={"maxiter":1000})
+
         return opt_result
 
 
@@ -283,13 +328,13 @@ class experiment():
         #print("Optimizing")
         #max_a, max_q = self.random_search(state, model)
         #return max_q
-        opt_loops = 20
+        opt_loops = 20 #changed 14.04
         f_max = 1e10
         for i in range(opt_loops):
             sol = - self.optimizer_control(model, con_model, state, con_model2).fun #-- To be used with scipy
             if sol < f_max:
                 f_max = sol
-        print(model.variance_con)
+        #print(model.variance_con)
         return f_max
 
     
@@ -312,14 +357,16 @@ class experiment():
 
             #print("X model: {}".format(model.inputs))
             #print("Y model: {}".format(model.outputs))
-
+            
+            #print("guess:", guess)
             s_a = np.hstack((state, guess))
             point = np.reshape(s_a, (1,-1))
             #print(point, point.shape)
             point = ((point - np.mean(model.inputs, axis=0)) / np.std(model.inputs, axis=0)).reshape(1,-1)
-            #print("model inputs {}".format(model.inputs))
+            point[np.isnan(point)] = 0
             #print(point, point.shape)
             q, q_var = model.core.predict(point)
+            #print(model.core[''])            #printing details of the model
             #print(q[0])
             #if q[0] != 0:
             #    print(q[0]) 
@@ -331,14 +378,15 @@ class experiment():
             #print("pen2", (pen2, pen_var2))
             pen1 = max(0, pen1)
             pen2 = max(0, pen2)
-            alpha = 1000
+            alpha = 0.9
             if self.bayes:
-                UCB = -q.item() * alpha - pen_var1.item() + (self.UCB_beta1) * pen1 \
+                UCB = - q.item() * alpha - pen_var1.item() * self.val_c + (self.UCB_beta1) * pen1 \
                     + np.sqrt(self.UCB_beta2) * pen2 
+            elif self.constr:
+                UCB = - q.item() * alpha - pen_var1.item() * self.UCB_beta1
             else:
-                UCB = -q.item() 
-
-            # print q values with and without constraits
+                UCB = - q.item() 
+            # print q values with and without constraints
             # debbug line by line
             # step by steps
 
@@ -528,7 +576,20 @@ class experiment():
         #print(self.models[0].inputs)
         return 
 
+    def test_pred(self):
+        for i in range(self.env.steps):
+            m = self.models[i]
+            print("inputs", m.inputs)
+            print("outputs", m.outputs)
 
+            print("core X", m.core.X)
+            print("core Y", m.core.Y)
+            test = m.core.X[0] + np.random.normal(0,0.1,(m.inputs[0].shape))
+            print(m.core[''])
+            print("test", test)
+            pred = m.core.predict(test)
+            print(pred)
+        return
 
     def new_training_step(self):
         r"The 'history' arrays are overwriten in every training iteration/step"
@@ -600,9 +661,10 @@ class experiment():
 
     def pre_filling(self):
         'Act randomly to initialise the once empty GP'
+        print("-------------Starting prefilling----------------")
         for i in range(self.config.pre_filling_iters):
             state = self.env.reset()
-            for i in range(self.env.steps):
+            for i in range(self.env.steps): #fill data
                 action = self.select_action(state, self.models[i], self.con_models[i], con_model2=self.con_models2[i], pre_filling=True)
                 ns, r, t_step = self.env.transition(state, action)
                 Y = r
@@ -619,35 +681,37 @@ class experiment():
                 self.con_models2[i].add_input(state, action)   #add new training inputs
                 self.con_models[i].add_output(V)               #add new training output
                 self.con_models2[i].add_output(V2)
-                
-
-                m = self.models[i].update()                    #refit GPregression
-                #print(self.models[i].inputs)
-                #print(m.X)
-                #print(self.models[i].outputs)
-                #print(m.Y)
-                self.models[i].constrain_lenghtsc()            #constrain the lenghtscale (tweak this)
-                m.optimize(max_f_eval = self.config.max_eval,messages=False) #, max_f_eval = 1000)
-                m.optimize_restarts(self.config.no_restarts)
-
-                con_m = self.con_models[i].update()            #re-fit constraints-keeeper model
-                self.con_models[i].constrain_lenghtsc()
-                con_m.optimize(max_f_eval = self.config.max_eval,messages=False) #, max_f_eval = 1000)
-                con_m.optimize_restarts(self.config.no_restarts)
-
-                #if self.two_V:
-                con_m2 = self.con_models2[i].update()
-                self.con_models2[i].constrain_lenghtsc()        #constrain/fix lenghtscale 
-                con_m2.optimize(max_f_eval = self.config.max_eval,messages=False)         
-                con_m2.optimize_restarts(self.config.no_restarts)
-
                 state = ns
+                
+        for i in range(self.env.steps): #update models
+            m = self.models[i].update()                    #refit GPregression
+            #print("GP inputs:", self.models[i].inputs)
+            #print("Core inputs:", m.X)
+            #print("GP outputs:", self.models[i].outputs)
+            #print("Core outputs", m.Y)
+            self.models[i].constrain_lenghtsc()            #constrain the lenghtscale (tweak this)
+            m.optimize(max_f_eval = self.config.max_eval,messages=False) #, max_f_eval = 1000)
+            m.optimize_restarts(self.config.no_restarts)
+
+            con_m = self.con_models[i].update()            #re-fit constraints-keeeper model
+            self.con_models[i].constrain_lenghtsc()
+            con_m.optimize(max_f_eval = self.config.max_eval,messages=False) #, max_f_eval = 1000)
+            con_m.optimize_restarts(self.config.no_restarts)
+
+            #if self.two_V:
+            con_m2 = self.con_models2[i].update()
+            self.con_models2[i].constrain_lenghtsc()        #constrain/fix lenghtscale 
+            con_m2.optimize(max_f_eval = self.config.max_eval,messages=False)         
+            con_m2.optimize_restarts(self.config.no_restarts)
+
+        print("=========================================")
         print("Prefilling complete, amount of data points: {}".format(len(self.models[0].inputs)))
         return
             
     
     def training_loop(self):
         self.pre_filling()
+        #self.test_pred()
         for i in range(config.training_iter):
             #raise AssertionError
             if not self.disc_rew:
@@ -676,9 +740,9 @@ class experiment():
             print('Validation epoch: {}'.format(self.training_iter))
             state = self.env.reset()
             for i in range(self.env.steps - 1):         #control steps are 1 less than training steps
-                action = self.best_action(state, self.models[i+1], self.con_models[i+1], self.con_models2[i+1])
+                action = self.best_action(state, self.models[i+1], self.con_models[i+1], self.con_models2[i+1], validation=True)
                 ns, r, t_step = self.env.transition(state, action)
-                self.models[i].add_val_result(state, action)    #add new training inputs
+                self.models[i].add_val_result(state, action)    #add new training inputsx
                 state = ns
         return
     
@@ -690,14 +754,14 @@ x0 = np.array([1,0,0,290,100])
 bounds = np.array([[0,270],[298,500]])
 config = configGP
 config.dims_input = x0.shape[0]
-config.training_iter = 50 #lets start with 1 iter
+config.training_iter = 70    #lets start with 1 iter
 
 
 time = timer()             
 env   = Env_base(params, steps, tf, x0, bounds, config.no_controls, noisy=False)
 #agent = GP_agent(env, config.input_dim)
 agent = GP_agent
-exp   = experiment(env, agent, config, UCB_beta1= 5000, UCB_beta2=70, bayes=True,\
+exp   = experiment(env, agent, config, UCB_beta1= 100, UCB_beta2=10, bayes=False, constr=True  , \
     disc_rew=True, two_V=True) #beta1 was 5000
 
 time.start()
