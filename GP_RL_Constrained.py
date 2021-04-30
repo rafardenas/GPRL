@@ -11,6 +11,8 @@ from collections import deque
 from numpy.random import default_rng
 from config_GP import configGP
 from timer import timer
+import json
+np.set_printoptions(suppress=True)
 
 
 class Env_base():
@@ -95,7 +97,7 @@ class Env_base():
 
 
 class GP_agent():
-    def __init__(self, env, dims_input):
+    def __init__(self, env, dims_input, model_no, name, config):
         self.env = env
         self.dims_input = dims_input
         self.kernel = GPy.kern.RBF(dims_input + self.env.no_controls, variance=1., lengthscale=None, ARD=True)
@@ -104,6 +106,12 @@ class GP_agent():
         self.valid_results = []
         self.core = None
         self.variance_con = None
+        self.data_variance = []
+        self.model_no = model_no
+        self.name = name
+        self.config = config
+        self.curr_variance      = 0
+        self.curr_con_variance  = 0
     
     def normalize_x(self, X):
         "Normalize X for the GPs"
@@ -125,24 +133,37 @@ class GP_agent():
             print(error)
         return X
 
-    def normalize_y(self, Y):
+    def normalize_y(self, Y, reverse = False):
         "normalize Y for the GPs, not in place, but in the fly"
-        try:
-            assert Y.any() != np.nan, "input is nan"
-            if len(self.outputs) == 1:
-                return np.zeros_like(Y, dtype=np.float64)
-            else:
-                #print(self.outputs)
-                #print(Y)
-                #print(np.mean(self.outputs, axis=0))
-                #print(np.std(self.outputs, axis=0))
-                #print(Y - np.mean(self.outputs, axis=0))
-                Y = (Y - np.mean(self.outputs, axis=0)) / np.std(self.outputs, axis=0)
-                #print(Y)
-                Y[np.isnan(Y)] = 0
-                #print(Y)
-        except AssertionError as error:
-            print(error)
+        if reverse:
+            try:
+                assert Y.any() != np.nan, "input is nan,  not in place, but in the fly"
+                if len(self.inputs) == 1:
+                    return np.zeros_like(Y, dtype=np.float64)
+                else:
+                    Y = (Y * np.std(self.outputs, axis=0) + np.mean(self.outputs, axis=0))
+                    Y[np.isnan(Y)] = 0
+            except AssertionError as error:
+                print(error)
+        else:
+            try:
+                assert Y.any() != np.nan, "input is nan"
+                if len(self.outputs) == 1:
+                    return np.zeros_like(Y, dtype=np.float64)
+                else:
+                    #print(self.outputs)
+                    #print(Y)
+                    #print(np.mean(self.outputs, axis=0))
+                    #print(np.std(self.outputs, axis=0))
+                    #print(Y - np.mean(self.outputs, axis=0))
+                    Y = (Y - np.mean(self.outputs, axis=0)) / np.std(self.outputs, axis=0)
+                    #print(Y)
+                    if isinstance(Y, np.ndarray):
+                        Y[np.isnan(Y)] = 0
+                    #print(Y) 
+            except AssertionError as error:
+                print(error)
+
         return Y
 
     def update(self):
@@ -171,9 +192,11 @@ class GP_agent():
         return
     
     def constrain_lenghtsc(self):
-        #pass
-        self.core['rbf.lengthscale'].constrain_bounded(0,10)
-        return 
+        if self.config.ls_lb is not None:
+            self.core['rbf.lengthscale'].constrain_bounded(self.config.ls_lb,self.config.ls_ub)
+        else:
+            pass
+        return
 
     def add_val_result(self, state, action):
         "state and actions have to be lists"
@@ -191,29 +214,40 @@ class GP_agent():
         if np.isnan(Y):
             Y = 0
         self.outputs.append(Y)
+
     def get_outputs(self):
         return self.outputs
 
+    def pop_input(self):
+        self.inputs.pop()
+
+    def pop_output(self):
+        self.outputs.pop()
+
+    def pop_var(self):
+        self.data_variance.pop()
     
 
 
-class experiment():
-    def __init__(self, env, agent, config, UCB_beta1, UCB_beta2, bayes=True, constr=False, disc_rew=False, two_V=False):
+class experiment(object):
+    def __init__(self, env, agent, config, decay_a, decay_b, UCB_beta1, UCB_beta2, bayes=True, constr=False, disc_rew=False, two_V=False):
         self.env = env
         self.config = config
+        self.decay_a = decay_a
+        self.decay_b = decay_b
         self.models = []
         self.con_models = []
         self.con_models2 = []
         self.two_V = two_V
         for i in range(self.env.steps): #instansiating one GP per time/control step to learn rewards
-            self.models.append(agent(self.env, self.config.dims_input))
+            self.models.append(agent(self.env, self.config.dims_input, i, "Rew {}".format(i), self.config))
         
         for i in range(self.env.steps): #one GP per time/control step to account for constraint violations
-            self.con_models.append(agent(self.env, self.config.dims_input))
+            self.con_models.append(agent(self.env, self.config.dims_input, i, "Constraint 1,{}".format(i), self.config))
 
         if two_V:
             for i in range(self.env.steps): #one GP per time/control step to account for constraint violations
-                self.con_models2.append(agent(self.env, self.config.dims_input))
+                self.con_models2.append(agent(self.env, self.config.dims_input, i, "Constraint 2,{}".format(i), self.config))
 
             
         
@@ -225,12 +259,19 @@ class experiment():
         self.v_history   = np.zeros(self.env.steps)
         self.v2_history  = np.zeros(self.env.steps)
 
+        self.alpha              = config.alp_begin
         self.UCB_beta1, self.UCB_beta2 = UCB_beta1, UCB_beta2
         self.bayes, self.constr = bayes, constr
-        self.disc_rew = disc_rew
-        self.training_iter = 0
-        self.val_c = 1
+        self.disc_rew           = disc_rew
+        self.training_iter      = 0
+        self.val_c              = 1
 
+        self.variances          = np.zeros((self.config.training_iter ,self.env.steps))
+        self.tr_iter            = 0
+        self.v1_q               = self.config.v1_q
+        self.qq                 = 0
+        self.mean_rew           = []
+        
 
     def select_action(self, state, model, con_model, con_model2 = None, pre_filling = False):
         eps = self.config.eps
@@ -247,17 +288,24 @@ class experiment():
     def best_action(self, state, model, con_model, con_model2 = None, validation=False): #arg max over actions
         #max_a, max_q = self.random_search(state, model)
         #return max_a
-        opt_loops = 20 #trying to cut this down?
+        opt_loops = 1 #trying to cut this down? #changed 19/04
         f_max = 1e10
         if not validation:
             for i in range(opt_loops):
                 sol = self.optimizer_control(model, con_model, state, con_model2)#-- To be used with scipy
                 if -sol.fun < f_max:
                     f_max = -sol.fun
+            
+            s_a = np.hstack((state, sol.x))
+            point = np.reshape(s_a, (1,-1))
+            #print("point")
+            #print("self.qq")
+            #print(sol.x)
+            #print("Predicted violation", con_model.core.predict(point)[0])
+            #print("Predicted violation2", con_model2.core.predict(point)[0])
             return sol.x #-- To be used with scipy
                 #print(-sol.fun, sol.x)
         elif validation:
-            print("Validation UCB")
             for i in range(opt_loops):
                 self.UCB_beta1, self.UCB_beta2, self.val_c = 0, 0, 0
                 sol = self.optimizer_control(model, con_model, state, con_model2)#-- To be used with scipy
@@ -285,8 +333,8 @@ class experiment():
 
 
     def optimizer_control(self, model, con_model, state, con_model2 = None):  #fix state, opt over actions
-        action_guess = self.random_action()
         #print(action_guess)
+        action_guess = self.random_action()
         assert isinstance(state, np.ndarray) #state has to be ndarray
 
         state = state
@@ -296,12 +344,14 @@ class experiment():
         def wrappercon1(action, state=state, c_model1=c_model1):
             s_a = np.hstack((state, action))
             point = np.reshape(s_a, (1,-1))
-            return c_model1.core.predict(point)[0].item() 
+            vio = c_model1.core.predict(point)[0]
+            return c_model1.normalize_y(vio, reverse=True).item()
 
         def wrappercon2(action, state=state, c_model2=c_model2):
             s_a = np.hstack((state, action))
             point = np.reshape(s_a, (1,-1))
-            return c_model2.core.predict(point)[0].item()
+            vio = c_model2.core.predict(point)[0]
+            return c_model2.normalize_y(vio, reverse=True).item()
 
         if self.bayes:
             opt_result = minimize(self.wrapper_UCB, action_guess, \
@@ -310,16 +360,30 @@ class experiment():
                 #The optimization here is not "constrained", have to set the constraints explicitely?
         
         elif self.constr:
-
-
-            con_T = NonlinearConstraint(wrappercon1, -np.inf, 0)   #need a wrapper for that method
-            con_V = NonlinearConstraint(wrappercon2, -np.inf, 0)  #will start with the "accepted" violation at 10
-
+            converged = False
+            restarts = 0
+            res = 1e6
+            con_T = NonlinearConstraint(wrappercon1, -np.inf, 0, keep_feasible=False)   #need a wrapper for that method
+            con_V = NonlinearConstraint(wrappercon2, -np.inf, 10, keep_feasible=False)  #will start with the "accepted" violation at 10
+            #try to set a constraint of the variance to be also minimum = less incertainty
             cons = {con_T, con_V}
-            opt_result = minimize(self.wrapper_UCB, action_guess, \
-                args = (state, model, con_model, con_model2), bounds=self.env.bounds, constraints = cons, \
-                options={"maxiter":1000})
-
+            while converged != True or restarts < 5:
+                action_guess = self.random_action()
+                opt_result = minimize(self.wrapper_UCB, action_guess, \
+                    args = (state, model, con_model, con_model2), bounds=self.env.bounds, constraints = cons, \
+                    options={"maxiter":100, "disp":False})
+                converged = opt_result.success
+                restarts += 1
+                if np.isnan(opt_result.fun):
+                    return opt_result
+                if opt_result.fun < res:
+                    res = opt_result.fun
+                    opt_result_temp = opt_result
+                if restarts == 3 or converged == True:
+                    break
+            #print("Out in {} restarts".format(restarts))
+            #print(opt_result_temp)
+            opt_result = opt_result_temp
         return opt_result
 
 
@@ -328,13 +392,12 @@ class experiment():
         #print("Optimizing")
         #max_a, max_q = self.random_search(state, model)
         #return max_q
-        opt_loops = 20 #changed 14.04
+        opt_loops = 1 #changed 14.04      #changed 19.04
         f_max = 1e10
         for i in range(opt_loops):
             sol = - self.optimizer_control(model, con_model, state, con_model2).fun #-- To be used with scipy
             if sol < f_max:
                 f_max = sol
-        #print(model.variance_con)
         return f_max
 
     
@@ -366,24 +429,29 @@ class experiment():
             point[np.isnan(point)] = 0
             #print(point, point.shape)
             q, q_var = model.core.predict(point)
+            #self.qq = point
             #print(model.core[''])            #printing details of the model
             #print(q[0])
             #if q[0] != 0:
             #    print(q[0]) 
             #print("q", (q,q_var))
             pen1, pen_var1 = con_model.core.predict(point)      #pen1: Temperature constraint
-            #print("pen1",(pen1, pen_var1))
-            model.variance_con = pen_var1
             pen2, pen_var2 = con_model2.core.predict(point)      #pen2: Volume constraint
+            #print("Violation in optimization normalized:", pen1)
+            #print("Violation in optimization:", con_model.normalize_y(pen1, reverse=True))
+            model.variance_con = pen_var1
             #print("pen2", (pen2, pen_var2))
-            pen1 = max(0, pen1)
-            pen2 = max(0, pen2)
-            alpha = 0.9
+            #pen1 = max(0, pen1)
+            #pen2 = max(0, pen2)
+            self.alpha     = 25 #self.decay_a.update(self.tr_iter)
+            self.UCB_beta1 = 25 #self.decay_b.update(self.tr_iter)
             if self.bayes:
-                UCB = - q.item() * alpha - pen_var1.item() * self.val_c + (self.UCB_beta1) * pen1 \
+                UCB = - q.item() * self.alpha - pen_var1.item() * self.val_c + (self.UCB_beta1) * pen1 \
                     + np.sqrt(self.UCB_beta2) * pen2 
             elif self.constr:
-                UCB = - q.item() * alpha - pen_var1.item() * self.UCB_beta1
+                UCB = - q.item() * self.alpha - pen_var1.item() * self.UCB_beta1
+                model.curr_variance = q_var.item()
+                model.curr_con_variance = pen_var1.item() 
             else:
                 UCB = - q.item() 
             # print q values with and without constraints
@@ -497,82 +565,160 @@ class experiment():
         But in this case we train the GPs with discounted reward
         and TWO violations, using one GP for each of them.
         """
-        state, action = self.s_history[-1], self.a_history[-1]
-        r = self.rew_history[-1] - self.rew_history[-2]
-        ns = self.ns_history[-1]
+        exception = True                          #added 28.04
+        while exception == True:                  #added 28.04
+            try:                                  #added 28.04
+                state, action = self.s_history[-1], self.a_history[-1]
+                r = self.rew_history[-1] - self.rew_history[-2]
+                ns = self.ns_history[-1]
 
-        Y = r + self.config.gamma * self.max_q((self.models[-1]), (self.con_models[-1]), ns, self.con_models2[-1])
-        self.v_history[-1] = self.violation1(ns)        #violation last state
-        self.v2_history[-1] = self.violation2(ns)
-        V = self.v_history[-1]
-        V2 = self.v2_history[-1]
+                Y = r + self.config.gamma * self.max_q((self.models[-1]), (self.con_models[-1]), ns, self.con_models2[-1])
+                self.models[-1].data_variance.append(self.models[-1].curr_variance)       #collect variance of the best action taken in each time step/model
+                self.con_models[-1].data_variance.append(self.models[-1].curr_con_variance)       #collect variances for each model
+                self.v_history[-1] = self.violation1(ns)        #violation last state
+                self.v2_history[-1] = self.violation2(ns)
+                V = max(0, self.v_history[-1])
+                V2 = max(0, self.v2_history[-1])
 
-        self.models[-1].add_input(state, action)        #add new training inputs
-        self.models[-1].add_output(Y)                   #add reward 
 
-        self.con_models[-1].add_input(state, action)    #add training points
-        self.con_models[-1].add_output(V)               #add violation
-        
-        self.con_models2[-1].add_input(state, action)   #adding 2nd violation (when applicable)
-        self.con_models2[-1].add_output(V2)             #add violation
+                #print("+++++++++++++++++++++")
+                #print("Model #: ", self.con_models[-1].model_no)
+                #print("Violation", self.v_history[-1])
+                #print(self.con_models[-1].outputs[-1])
+                #print("Temperature", self.s_history[-1][3])
+                #print("====================")
 
-        
-        m = self.models[-1].update()                    #re-fit GPregression
-        self.models[-1].constrain_lenghtsc()
-        m.optimize(max_f_eval = self.config.max_eval, messages=False)                      #constrain lengtscale
-        m.optimize_restarts(self.config.no_restarts)
-        
-        con_m = self.con_models[-1].update()            #re-fit constraints-keeeper model
-        self.con_models[-1].constrain_lenghtsc()        #constrain lengtscale
-        con_m.optimize(max_f_eval = self.config.max_eval, messages=False)
-        con_m.optimize_restarts(self.config.no_restarts)
+                self.models[-1].add_input(state, action)        #add new training inputs
+                self.models[-1].add_output(Y)                   #add reward 
 
-        con_m2 = self.con_models2[-1].update()          #re-fit constraints-keeeper model
-        self.con_models2[-1].constrain_lenghtsc()       #constrain lengtscale
-        con_m2.optimize(max_f_eval = self.config.max_eval, messages=False)
-        con_m2.optimize_restarts(self.config.no_restarts)
+                self.con_models[-1].add_input(state, action)    #add training points
+                self.con_models[-1].add_output(V)               #add violation
+                
+                self.con_models2[-1].add_input(state, action)   #adding 2nd violation (when applicable)
+                self.con_models2[-1].add_output(V2)             #add violation
 
-        
+                
+                m = self.models[-1].update()                    #re-fit GPregression
+                self.models[-1].constrain_lenghtsc()
+                m.optimize(max_f_eval = self.config.max_eval, messages=False)                      #constrain lengtscale
+                m.optimize_restarts(self.config.no_restarts)
+                #print("================== Reward model: {} =========================".format(self.models[-1].model_no))
+                #print(m['rbf.variance'])
+                
+                con_m = self.con_models[-1].update()            #re-fit constraints-keeeper model
+                self.con_models[-1].constrain_lenghtsc()        #constrain lengtscale
+                con_m.optimize(max_f_eval = self.config.max_eval, messages=False)
+                con_m.optimize_restarts(self.config.no_restarts)
+                #print("================== Constrained model1: {} =========================".format(self.con_models[-1].model_no))
+                #print(con_m[''])
+
+                con_m2 = self.con_models2[-1].update()          #re-fit constraints-keeeper model
+                self.con_models2[-1].constrain_lenghtsc()       #constrain lengtscale
+                con_m2.optimize(max_f_eval = self.config.max_eval, messages=False)
+                con_m2.optimize_restarts(self.config.no_restarts)
+                exception = False
+            
+            except np.linalg.LinAlgError as e:
+                exception = True
+                if "not positive definite, even with jitter." in str(e):
+                    self.models[-1].pop_input()     #drop new training inputs
+                    self.models[-1].pop_output()
+
+                    self.con_models[-1].pop_input()
+                    self.con_models[-1].pop_output()            
+
+                    self.con_models2[-1].pop_input()  
+                    self.con_models2[-1].pop_output()
+
+                    self.models[-1].pop_var()
+                    self.con_models[-1].pop_var()
+                    print("++++++++++++++++++++++++++++++++++++++", end="\n")
+                    print("Not positive definite matrix :( in model 10")
+                    print("++++++++++++++++++++++++++++++++++++++", end="\n")
+                else:
+                    raise
+
+        #while True:
         for i in range(self.env.steps-2, -1, -1):#changed 04.03 |was range(self.env.steps-2, 0, -1)
-            state, action = self.s_history[i], self.a_history[i]
-            r = self.rew_history[i] - self.rew_history[i-1]
-            #print(i)
-            #print(self.rew_history[i])
-            #print("rew" , r)
-            ns = self.ns_history[i]
-            self.v_history[i] = self.violations(state)     #violation in ns? || changed for state
-            self.v2_history[i] = self.violation2(state)
-            #changed on 04.03 from self.models[i] || changed on 17.03 from models[i+1] to current
-            Y = r + self.config.gamma * self.max_q((self.models[i]), (self.con_models[i]), ns, (self.con_models2[i]))
-            #print("Which model use to get the max Q? in the same or the next time step?")
-            V  = self.v_history[i] + self.v_history[i + 1]
-            V2 = self.v2_history[i] + self.v2_history[i + 1]
+            
+            exception = True                          #added 20.04
+            while exception == True:                  #added 20.04
+                try:                                  #added 20.04
+                    state, action = self.s_history[i], self.a_history[i]
+                    r = self.rew_history[i] - self.rew_history[i-1]
+                    #print(i)
+                    #print(self.rew_history[i])
+                    #print("rew" , r)
+                    ns = self.ns_history[i]
+                    self.v_history[i] = self.violation1(state)     #violation in ns? || changed for state
+                    self.v2_history[i] = self.violation2(state)
+                    #changed on 04.03 from self.models[i] || changed on 17.03 from models[i+1] to current
+                    Y = r + self.config.gamma * self.max_q((self.models[i]), (self.con_models[i]), ns, (self.con_models2[i]))
+                    self.models[i].data_variance.append(self.models[i].curr_variance)       #collect variance of the best action taken in each time step/model
+                    self.con_models[i].data_variance.append(self.models[i].curr_variance)
+                    #print("Which model use to get the max Q? in the same or the next time step?")
+                    #V  = self.v_history[i] + self.v_history[i + 1]    
+                    V  = max(0, (self.v_history[i + 1]))     #changed 29/04
+                    V2 = max(0, (self.v2_history[i + 1]))   
 
-            self.models[i].add_input(state, action)     #add new training inputs
-            self.models[i].add_output(Y)
+                    #if self.con_models[i].model_no == 0 or self.con_models[i].model_no == 1:
+                    #print("+++++++++++++++++++++")
+                    #print("Model #: ", self.con_models[i].model_no)
+                    #print("Violation", self.v_history[i])
+                    #print(self.con_models[i].outputs[-1])
+                    #print("Temperature", self.s_history[i][3])
+                    #print("====================")
 
-            self.con_models[i].add_input(state, action) #add training points
-            self.con_models[i].add_output(V)            #add violation to model
+                
+                    self.models[i].add_input(state, action)     #add new training inputs
+                    self.models[i].add_output(Y)
 
-            self.con_models2[i].add_input(state, action)   #adding 2nd violation (when applicable)
-            self.con_models2[i].add_output(V2)               #add violation
+                    self.con_models[i].add_input(state, action) #add training points
+                    self.con_models[i].add_output(V)            #add violation to model
 
-            m = self.models[i].update()                 #fit GPregression
-            self.models[i].constrain_lenghtsc()
-            m.optimize(max_f_eval = self.config.max_eval, messages=False)
-            m.optimize_restarts(self.config.no_restarts)
+                    self.con_models2[i].add_input(state, action)   #adding 2nd violation (when applicable)
+                    self.con_models2[i].add_output(V2)               #add violation
 
-            con_m = self.con_models[i].update()         #re-fit constraints-keeeper model
-            self.con_models[i].constrain_lenghtsc()
-            con_m.optimize(max_f_eval = self.config.max_eval, messages=False)
-            con_m.optimize_restarts(self.config.no_restarts)
+                    m = self.models[i].update()                 #fit GPregression
+                    self.models[i].constrain_lenghtsc()
+                    m.optimize(max_f_eval = self.config.max_eval, messages=False)
+                    m.optimize_restarts(self.config.no_restarts)
+                    #print("================== Reward model: {} =========================".format(self.models[i].model_no))
+                    #print(m['rbf.variance'])
+                    #self.models[i].data_variance.append(m['rbf.variance'].item())       #collect variances for each model
 
-            con_m2 = self.con_models2[i].update()            #re-fit constraints-keeeper model
-            self.con_models2[i].constrain_lenghtsc()
-            con_m2.optimize(max_f_eval = self.config.max_eval, messages=False)
-            con_m2.optimize_restarts(self.config.no_restarts)
+                    con_m = self.con_models[i].update()         #re-fit constraints-keeeper model
+                    self.con_models[i].constrain_lenghtsc()
+                    con_m.optimize(max_f_eval = self.config.max_eval, messages=False)
+                    con_m.optimize_restarts(self.config.no_restarts)
+                    #print("================== Constrained model1: {} =========================".format(self.con_models[i].model_no))
+                    #print(con_m[''])
 
+                    con_m2 = self.con_models2[i].update()            #re-fit constraints-keeeper model
+                    self.con_models2[i].constrain_lenghtsc()
+                    con_m2.optimize(max_f_eval = self.config.max_eval, messages=False)
+                    con_m2.optimize_restarts(self.config.no_restarts)
 
+                    exception = False
+                except np.linalg.LinAlgError as e:
+                    exception = True
+                    if "not positive definite, even with jitter." in str(e):
+                        self.models[i].pop_input()     #drop new training inputs
+                        self.models[i].pop_output()
+
+                        self.con_models[i].pop_input()
+                        self.con_models[i].pop_output()            
+
+                        self.con_models2[i].pop_input()  
+                        self.con_models2[i].pop_output()
+
+                        self.models[i].pop_var()
+                        self.con_models[i].pop_var()
+                        print("++++++++++++++++++++++++++++++++++++++", end="\n")
+                        print("Not positive definite matrix :( in model {}".format(i))
+                        print("++++++++++++++++++++++++++++++++++++++", end="\n")
+                    else:
+                        raise
         #print(self.models[0].inputs)
         return 
 
@@ -601,10 +747,32 @@ class experiment():
             self.a_history[i] = action
             self.ns_history[i], self.rew_history[i], t_step = self.env.transition(state, action)
             self.s_history[i] = state   
-            state = self.ns_history[i]  
+
+            s_a = np.hstack((state, action))
+            point = np.reshape(s_a, (1,-1))
+            point = self.con_models[i].normalize_x(point)
+            #print("Inputs: ", self.con_models[i].inputs) 
+            #print("Outputs GP: ", self.con_models[i].outputs)
+            #print("Outputs core: ", self.con_models[i].core.Y)
+
+            #print("Real reward: ", self.rew_history[i])
+            #print("Predicted reward: ", self.models[i].core.predict(point))
+            #print(self.models[i].core[''])
+
+            #print("Real state", self.ns_history[i])
+            pred_vio = self.con_models[i].core.predict(point)
+            #print("Predicted violation and variance", pred_vio)
+            #print("Predicted violation de-normalized", self.con_models[i].normalize_y(pred_vio[0], reverse=True))
+            #print("Real violation", self.violation1(self.ns_history[i]))
+            #print("Real violation normalized:", self.con_models[i].normalize_y(self.violation1(self.ns_history[i])))
+            state = self.ns_history[i]
+
+        #print("+++++++++++++++++++++")
+        #print("History:", self.s_history)
         #changed from here 03.03 and 10.03
         if self.two_V:
             self.update_models_two_const()
+            self.mean_rew.append(np.mean(self.rew_history))
         else:
             self.update_models()
         return
@@ -615,22 +783,27 @@ class experiment():
         Vcon_index = 4
         violation = (state[Tcon_index] - 420)  + (max(self.ns_history[-1][Vcon_index] - 800, 0))\
             *(420/800)
-        if violation > 0:
-            violation *= 3
+        #violation = (state[Tcon_index] - self.v1_q)  + (max(self.ns_history[-1][Vcon_index] - 800, 0))\
+        #    *(self.v1_q/800)    
+        #if violation > 0:
+        #    violation *= self.config.v_c
         return violation
 
     def violation1(self, state):
         Tcon_index = int(3)
         violation = (state[Tcon_index] - 420)
+        #violation = max(0, (state[Tcon_index] - self.v1_q))
         if violation > 0:
-            violation *= 3
-        return violation
+            violation *= self.config.v_c
+        #print("violation", violation)
+        return violation #, state[Tcon_index]
            
     def violation2(self, state):
         Vcon_index = 4
         violation = (max(0, self.ns_history[-1][Vcon_index] - 800)) * (420/800)
+        #violation = (max(0, self.ns_history[-1][Vcon_index] - 800)) * (self.v1_q/800)
         if violation > 0:
-            violation *= 3
+            violation *= self.config.v_c
         return violation
 
     #######################################
@@ -640,22 +813,27 @@ class experiment():
         Vcon_index = 4
         violation = (state[Tcon_index] - 420) + (max(state[Vcon_index] - 800, 0))\
             *(420/800)
+        #learning tighter
+        #violation = (state[Tcon_index] - self.v1_q + (max(state[Vcon_index] - 800, 0))\
+        #    *(self.v1_q/800))
         if violation > 0:
-            violation *= 3
+            violation *= self.config.v_c
         return violation
 
     def violation1_prefill(self, state):
         Tcon_index = int(3)
         violation = (state[Tcon_index] - 420)
-        if violation > 0:
-            violation *= 3
+        #violation = max(0, (state[Tcon_index] - self.v1_q))
+        #if violation > 0:
+        #    violation *= self.config.v_c
         return violation
 
     def violation2_prefill(self, state):
         Vcon_index = 4
         violation = (max(state[Vcon_index] - 800, 0)) * (420/800)
-        if violation > 0:
-            violation *= 3
+        #violation = (max(state[Vcon_index] - 800, 0)) * (self.v1_q/800)        #only leraning tighter the temperature constraint
+        #if violation > 0:
+        #    violation *= 3
         return violation
 
 
@@ -712,8 +890,11 @@ class experiment():
     def training_loop(self):
         self.pre_filling()
         #self.test_pred()
-        for i in range(config.training_iter):
-            #raise AssertionError
+        for i in range(self.config.training_iter):
+            self.tr_iter = self.tr_iter + 1
+            print("tr_iter", self.tr_iter)
+            print("alpha:", self.alpha)
+            print("beta:", self.UCB_beta1)
             if not self.disc_rew:
                 self.training_step()
             else:
@@ -733,128 +914,86 @@ class experiment():
     def get_trained_models(self):
         return self.models
     
+    
+
     def validation_loop(self):
+        self.alpha = self.config.alp_begin
         self.training_iter = 0
         for i in range(self.config.valid_iter):
             self.training_iter += 1
             print('Validation epoch: {}'.format(self.training_iter))
             state = self.env.reset()
             for i in range(self.env.steps - 1):         #control steps are 1 less than training steps
-                action = self.best_action(state, self.models[i+1], self.con_models[i+1], self.con_models2[i+1], validation=True)
+                action = self.best_action(state, self.models[i], self.con_models[i], self.con_models2[i], validation=True)
                 ns, r, t_step = self.env.transition(state, action)
                 self.models[i].add_val_result(state, action)    #add new training inputsx
                 state = ns
+        return 
+
+    def get_var_data(self):
+        data = np.zeros((len(self.models), len(self.models[-1].data_variance)))
+        for model in range(len(self.models)):
+            for var in range(len(self.models[model].data_variance)):
+                x = self.models[model].data_variance[var]
+                data[model][var] = x
+        return data
+    
+    def get_var_con_data(self):
+        data = np.zeros((len(self.con_models), len(self.con_models[-1].data_variance)))
+        for model in range(len(self.con_models)):
+            for var in range(len(self.con_models[model].data_variance)):
+                x = self.con_models[model].data_variance[var]
+                data[model][var] = x
+        #print("Name:", self.con_models[-1].name)
+        return data
+    
+    def save_rew_models(self):
+        i = 0
+        for model in self.models:
+            data = model.core.to_dict()
+            json.dump(data, open("Models/Rew_model {}".format(i), 'w'))
+            i += 1
         return
     
-params = {'CpA':30.,'CpB':60.,'CpC':20.,'CpH2SO4':35.,'T0':305.,'HRA':-6500.,'HRB':8000.,'E1A':9500./1.987,'E2A':7000./1.987,'A1':1.25,\
-                 'Tr1':420.,'Tr2':400.,'CA0':4.,'A2':0.08,'UA':4.5,'N0H2S04':100.}
-steps = 11
-tf= 4
-x0 = np.array([1,0,0,290,100])
-bounds = np.array([[0,270],[298,500]])
-config = configGP
-config.dims_input = x0.shape[0]
-config.training_iter = 70    #lets start with 1 iter
+    def save_con_models(self):
+        i = 0
+        for model in self.con_models:
+            data = model.core.to_dict()
+            json.dump(data, open("Models/Con_model {}".format(i), 'w'))
+            i += 1
+        return
+
+    def save_con_models2(self):
+        i = 0
+        for model in self.con_models2:
+            data = model.core.to_dict()
+            json.dump(data, open("Models/Con_model2 {}".format(i), 'w'))
+            i += 1
+        return
 
 
-time = timer()             
-env   = Env_base(params, steps, tf, x0, bounds, config.no_controls, noisy=False)
-#agent = GP_agent(env, config.input_dim)
-agent = GP_agent
-exp   = experiment(env, agent, config, UCB_beta1= 100, UCB_beta2=10, bayes=False, constr=True  , \
-    disc_rew=True, two_V=True) #beta1 was 5000
+    
+class expexpl(object):
+    def __init__(self, eps_begin, eps_end, rate, nsteps, increase=False):
+        self.epsilon = eps_begin
+        self.eps_begin = eps_begin
+        self.eps_end = eps_end
+        self.rate = rate
+        self.nsteps = nsteps
+        self.increase = increase
+    
+    def update(self, t):
+        if t < self.nsteps:
+            if self.increase:
+                self.epsilon = self.eps_begin * np.exp(t/self.rate)
+            else:
+                self.epsilon = self.eps_begin * np.exp(- t/self.rate) + self.eps_end
+            
+        else:
+            self.epsilon = self.eps_end
+        return self.epsilon
 
-time.start()
-
-exp.training_loop()
-exp.validation_loop()
-
-time.end()
-
-print("Done :)")
-
-
-"""
-#trial = GP_agent(env, config.dims_input)
-#print(trial.core)
-inns = np.array([[8.67214319e-01, 1.03592312e+00, 4.01511313e-01, 3.96219817e+02,
-  3.78183804e+02, 1.41935918e+02, 4.37589994e+02],
- [2.82460912e-01, 1.25708208e+00, 4.84650221e-01, 5.17531204e+02,
-  3.40802688e+02, 9.20412832e+01, 4.91731495e+02],
- [2.37472379e+00, 2.66660773e-01, 1.82170060e-02, 3.49939224e+02,
-  2.77826880e+02, 4.27925666e+01, 3.10711971e+02],
- [2.76691289e+00, 2.42538352e-01, 9.82571870e-03, 3.94765185e+02,
-  4.04607312e+02, 6.77096436e+00, 3.94707595e+02],
- [5.22617295e-01, 1.05682430e+00, 5.89144903e-01, 4.76123839e+02,
-  3.08969206e+02, 3.02658147e+01, 4.02229175e+02]])
-
-#print(inns.shape, "\n")
-outts = np.array([[151.84507593],
-    [7.17009794], #165.17009794]
-    [  5.06117393],
-    [  3.97555763],
-    [4.02763254]]) #182.02763254
-trial.add_input2(inns)
-trial.add_output(outts)
-m = trial.update()
-m.optimize()
-#print(m)
-test = np.array([2.37472379e+00,1.25708208e+00,5.89144903e-01,4.76123839e+02,3.78183804e+02,
-3.02658147e+01,4.02229175e+02], dtype=np.float64).reshape(1,-1)
-prd = m.predict(test)
-#print(prd)
-
-ker = GPy.kern.RBF(input_dim=7,variance=1., lengthscale=1., ARD=True)
-m2 = GPy.models.GPRegression(inns,outts,ker, noise_var=1.)
-m2.optimize(messages=False)
-m2.optimize_restarts(3, messages=False)
-prd2 = m2.predict(test)
-#print(prd2)
-#print(m2.X)
-"""
+    
 
 
 
-#exp2   = experiment(env, agent, config, bayes=False)
-#exp2.training_loop()
-#exp2.validation_loop()
-
-outputs = np.zeros((config.training_iter, steps - 1, config.dims_input+config.no_controls))
-validation_data = np.zeros((config.valid_iter, steps - 1 , config.dims_input+config.no_controls+1))
-#validation_data_2 = np.zeros((config.valid_iter, steps, config.dims_input+config.no_controls+1))
-
-#for i in range(config.training_iter):
-#    for j in range(steps - 1):
-#        outputs[i,j,:] = exp.get_train_inputs(exp.models[j])[i]
-
-#validating experiment
-
-for i in range(config.valid_iter):
-    for j in range(steps - 1):
-        validation_data[i,j,:] = exp.get_validation_data(exp.models[j])[i]
-#        validation_data_2[i,j,:] = exp2.get_validation_data(exp2.models[j])[i]
-
-
-
-def plotting(data):
-    fig, axs = plt.subplots(8, 1,sharex=True,figsize=(8,10))
-    legend = ['$C_a$ (kmol m$^{-3}$)','$C_b$ (kmol m$^{-3}$)','$C_c$ (kmol m$^{-3}$)','$T$ (K)','$V$ (m$^3$)','$F$ (m$^3$hr$^{-1}$)','$T_a$ (K)', 'Production $C_c$ (kmol)']
-    for j in range(data.shape[-1]):
-        xx = data[:,:,j]
-        for i in range(data.shape[0]):
-            axs[j].plot(np.arange(len(xx[i,:])), xx[i,:])#, label = 'iteration #: {}'.format(str(i)))
-            if j == 3:
-                axs[j].plot(np.arange(len(xx[i,:])),[420 for i in range(len(xx))],c='r',linewidth=1.4,linestyle='--')
-            if j == 4:
-                axs[j].plot(np.arange(len(xx[i,:])),[800 for i in range(len(xx))],c='r',linewidth=1.4,linestyle='--')
-            axs[j].set_ylabel(legend[j])
-    #print(len(xx))
-    plt.show()
-
-#print(np.mean(exp.models[-1].inputs, axis=0))
-plotting(validation_data)
-#plotting(validation_data_2)
-
-#Plot of the reward at the end
-#random search does not contributes to the stability of the controller
-#try to iterate more and see if it converges
