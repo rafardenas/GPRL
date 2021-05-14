@@ -13,12 +13,12 @@ class configGP():
     pre_filling_iters = 20
     
     #training
-    training_iter     = 50
+    training_iter     = 20
     
     #alpha
     alp_begin         = 10
-    alp_end           = 20
-    iter_end          = 50
+    alp_end           = 35
+    iter_end          = 75  
     alp_up_anneal     = True 
     if alp_up_anneal == True:
         alp_rate          = training_iter / np.log(alp_end/alp_begin)
@@ -27,14 +27,14 @@ class configGP():
 
     
     #beta
-    bet_begin         = 25  
-    bet_end           = 5
+    bet_begin         = 30  
+    bet_end           = 1
     bet_rate          = - iter_end / np.log(bet_end/bet_begin)
     
     #increased penalty over constraint violation
-    v_c               = 400    
+    v_c               = 20000    
     #1. constraint limit
-    v1_q              = 100           
+    v1_q              = 420           
     save              = True
     #lenghtscale constraining
     ls_lb             = None

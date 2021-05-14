@@ -36,7 +36,7 @@ env   = Env_base(params, steps, tf, x0, bounds, config.no_controls, noisy=False)
 decay_a = expexpl(config.alp_begin, config.alp_end, config.alp_rate, config.training_iter, increase=config.alp_up_anneal)
 decay_b = expexpl(config.bet_begin, config.bet_end, config.bet_rate, config.training_iter)
 agent = GP_agent
-exp   = experiment(env, agent, config, decay_a, decay_b, UCB_beta1=config.bet_begin, UCB_beta2=10, bayes=False, constr=True, \
+exp   = experiment(env, agent, config, decay_a, decay_b, UCB_beta1=config.bet_begin, UCB_beta2=10, bayes=True, constr=False, \
     disc_rew=True, two_V=True) #beta1 was 5000
 
 time.start()
@@ -55,6 +55,7 @@ if config.save:
 variances = exp.get_var_data()
 con_variancies = exp.get_var_con_data()
 mean_rew = exp.mean_rew
+viols = exp.error_vio
 print("Done :)")
 
 
@@ -98,11 +99,20 @@ def plot_rew(rewards,title):
     axs.set_ylabel("Mean Reward")
     plt.show()
 
+def plot_viol(violations,title):
+    fig, axs = plt.subplots(1, 1,figsize=(8,10))
+    axs.plot(np.arange(0,len(violations),1), violations)
+    axs.set_title(title)
+    axs.set_xlabel("Tr Iterations")
+    axs.set_ylabel("Violation ")
+    plt.show()
+
 
 plotting(validation_data)
 plot_variances(variances, "Variances over time; Reward Models")
 plot_variances(con_variancies, "Variances over time; Constraint 1 Models")
 plot_rew(mean_rew, "Rewards over iters")
+plot_viol(viols, "Violations")
 
 #Plot of the reward at the end
 #random search does not contributes to the stability of the controller

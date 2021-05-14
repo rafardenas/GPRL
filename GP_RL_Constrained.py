@@ -1,6 +1,7 @@
 #GP-RL Paper
 
 import gym
+import scipy.optimize
 import numpy as np
 import matplotlib.pyplot as plt
 import GPy
@@ -103,7 +104,6 @@ class GP_agent():
         self.kernel = GPy.kern.RBF(dims_input + self.env.no_controls, variance=1., lengthscale=None, ARD=True)
         self.inputs = []
         self.outputs = []
-        self.valid_results = []
         self.core = None
         self.variance_con = None
         self.data_variance = []
@@ -271,6 +271,7 @@ class experiment(object):
         self.v1_q               = self.config.v1_q
         self.qq                 = 0
         self.mean_rew           = []
+        self.error_vio          = []
         
 
     def select_action(self, state, model, con_model, con_model2 = None, pre_filling = False):
@@ -306,7 +307,7 @@ class experiment(object):
             return sol.x #-- To be used with scipy
                 #print(-sol.fun, sol.x)
         elif validation:
-            for i in range(opt_loops):
+            for i in range(5):
                 self.UCB_beta1, self.UCB_beta2, self.val_c = 0, 0, 0
                 sol = self.optimizer_control(model, con_model, state, con_model2)#-- To be used with scipy
                 if -sol.fun < f_max:
@@ -358,11 +359,13 @@ class experiment(object):
                 args = (state, model, con_model, con_model2), bounds = self.env.bounds, options={"maxiter":5000}) 
                 #fixing states and maximizing over the actions
                 #The optimization here is not "constrained", have to set the constraints explicitely?
+            return opt_result
         
         elif self.constr:
             converged = False
             restarts = 0
             res = 1e6
+            opt_result_temp = np.nan
             con_T = NonlinearConstraint(wrappercon1, -np.inf, 0, keep_feasible=False)   #need a wrapper for that method
             con_V = NonlinearConstraint(wrappercon2, -np.inf, 10, keep_feasible=False)  #will start with the "accepted" violation at 10
             #try to set a constraint of the variance to be also minimum = less incertainty
@@ -374,8 +377,6 @@ class experiment(object):
                     options={"maxiter":100, "disp":False})
                 converged = opt_result.success
                 restarts += 1
-                if np.isnan(opt_result.fun):
-                    return opt_result
                 if opt_result.fun < res:
                     res = opt_result.fun
                     opt_result_temp = opt_result
@@ -383,8 +384,10 @@ class experiment(object):
                     break
             #print("Out in {} restarts".format(restarts))
             #print(opt_result_temp)
-            opt_result = opt_result_temp
-        return opt_result
+            if isinstance(opt_result_temp, scipy.optimize.OptimizeResult):
+                return opt_result_temp
+            else:
+                return opt_result
 
 
 
@@ -443,13 +446,15 @@ class experiment(object):
             #print("pen2", (pen2, pen_var2))
             #pen1 = max(0, pen1)
             #pen2 = max(0, pen2)
-            self.alpha     = 25 #self.decay_a.update(self.tr_iter)
-            self.UCB_beta1 = 25 #self.decay_b.update(self.tr_iter)
+            self.alpha     = 10 #self.decay_a.update(self.tr_iter)
+            self.UCB_beta1 = 20 #self.decay_b.update(self.tr_iter)
+
             if self.bayes:
-                UCB = - q.item() * self.alpha - pen_var1.item() * self.val_c + (self.UCB_beta1) * pen1 \
-                    + np.sqrt(self.UCB_beta2) * pen2 
+                UCB = - q.item() * self.alpha - np.sqrt(pen_var1.item()) * self.val_c + (self.UCB_beta1) * pen1 \
+                    + np.sqrt(self.UCB_beta2) * pen2
+
             elif self.constr:
-                UCB = - q.item() * self.alpha - pen_var1.item() * self.UCB_beta1
+                UCB = q.item() * self.alpha - pen_var1.item() * self.UCB_beta1  #strictly, the "beta" term is missing a square root.
                 model.curr_variance = q_var.item()
                 model.curr_con_variance = pen_var1.item() 
             else:
@@ -571,14 +576,14 @@ class experiment(object):
                 state, action = self.s_history[-1], self.a_history[-1]
                 r = self.rew_history[-1] - self.rew_history[-2]
                 ns = self.ns_history[-1]
-
+                #print("Current state", state)
                 Y = r + self.config.gamma * self.max_q((self.models[-1]), (self.con_models[-1]), ns, self.con_models2[-1])
                 self.models[-1].data_variance.append(self.models[-1].curr_variance)       #collect variance of the best action taken in each time step/model
                 self.con_models[-1].data_variance.append(self.models[-1].curr_con_variance)       #collect variances for each model
                 self.v_history[-1] = self.violation1(ns)        #violation last state
                 self.v2_history[-1] = self.violation2(ns)
-                V = max(0, self.v_history[-1])
-                V2 = max(0, self.v2_history[-1])
+                V = self.v_history[-1] + self.v_history[-2]
+                V2 = self.v2_history[-1] + self.v2_history[-2]
 
 
                 #print("+++++++++++++++++++++")
@@ -646,6 +651,7 @@ class experiment(object):
                 try:                                  #added 20.04
                     state, action = self.s_history[i], self.a_history[i]
                     r = self.rew_history[i] - self.rew_history[i-1]
+                    #print("state:", state)
                     #print(i)
                     #print(self.rew_history[i])
                     #print("rew" , r)
@@ -653,13 +659,13 @@ class experiment(object):
                     self.v_history[i] = self.violation1(state)     #violation in ns? || changed for state
                     self.v2_history[i] = self.violation2(state)
                     #changed on 04.03 from self.models[i] || changed on 17.03 from models[i+1] to current
-                    Y = r + self.config.gamma * self.max_q((self.models[i]), (self.con_models[i]), ns, (self.con_models2[i]))
+                    Y = r + self.config.gamma * self.max_q((self.models[i+1]), (self.con_models[i+1]), ns, (self.con_models2[i+1]))
                     self.models[i].data_variance.append(self.models[i].curr_variance)       #collect variance of the best action taken in each time step/model
                     self.con_models[i].data_variance.append(self.models[i].curr_variance)
                     #print("Which model use to get the max Q? in the same or the next time step?")
                     #V  = self.v_history[i] + self.v_history[i + 1]    
-                    V  = max(0, (self.v_history[i + 1]))     #changed 29/04
-                    V2 = max(0, (self.v2_history[i + 1]))   
+                    V  = self.v_history[i] + self.v_history[i + 1]     #changed 29/04
+                    V2 = self.v2_history[i] + self.v2_history[i + 1]   #changed 30/04
 
                     #if self.con_models[i].model_no == 0 or self.con_models[i].model_no == 1:
                     #print("+++++++++++++++++++++")
@@ -742,6 +748,7 @@ class experiment(object):
         self.training_iter += 1
         print("Training epoch: {}".format(self.training_iter))
         state = self.env.reset()
+        tr_eps_vio_error = 0
         for i in range(self.env.steps): #one <s,a,r,ns> tuple point per time step/GP #changed 17.03 before: (self.env.steps - 1)
             action = self.best_action(state, self.models[i], self.con_models[i], self.con_models2[i])
             self.a_history[i] = action
@@ -751,7 +758,8 @@ class experiment(object):
             s_a = np.hstack((state, action))
             point = np.reshape(s_a, (1,-1))
             point = self.con_models[i].normalize_x(point)
-            #print("Inputs: ", self.con_models[i].inputs) 
+            
+            #print("Inputs GP: ", self.con_models[i].inputs) 
             #print("Outputs GP: ", self.con_models[i].outputs)
             #print("Outputs core: ", self.con_models[i].core.Y)
 
@@ -760,15 +768,24 @@ class experiment(object):
             #print(self.models[i].core[''])
 
             #print("Real state", self.ns_history[i])
-            pred_vio = self.con_models[i].core.predict(point)
+            pred_vio = self.con_models[i].normalize_y(self.con_models[i].core.predict(point)[0], reverse=True).item()
+            real_vio = self.violation1(self.ns_history[i])
+            tr_eps_vio_error += abs(pred_vio-real_vio)
             #print("Predicted violation and variance", pred_vio)
-            #print("Predicted violation de-normalized", self.con_models[i].normalize_y(pred_vio[0], reverse=True))
+            #print("Predicted violation de-normalized", self.con_models[i].normalize_y(pred_vio, reverse=True))
             #print("Real violation", self.violation1(self.ns_history[i]))
             #print("Real violation normalized:", self.con_models[i].normalize_y(self.violation1(self.ns_history[i])))
             state = self.ns_history[i]
 
+        if self.training_iter == 20:  
+            print("Inputs GP: ", self.models[2].inputs) 
+            print(self.models[2].core[''])
+
+        self.error_vio.append(tr_eps_vio_error / i)
+        #print(self.error_vio)
         #print("+++++++++++++++++++++")
         #print("History:", self.s_history)
+        #print("Ns history:", self.ns_history)
         #changed from here 03.03 and 10.03
         if self.two_V:
             self.update_models_two_const()
@@ -791,19 +808,20 @@ class experiment(object):
 
     def violation1(self, state):
         Tcon_index = int(3)
-        violation = (state[Tcon_index] - 420)
-        #violation = max(0, (state[Tcon_index] - self.v1_q))
-        if violation > 0:
-            violation *= self.config.v_c
+        #violation = (state[Tcon_index] - 420)
+        violation = max(0, (state[Tcon_index] - self.v1_q))
+        #if violation > 0:
+        #    violation *= self.config.v_c
         #print("violation", violation)
         return violation #, state[Tcon_index]
            
     def violation2(self, state):
         Vcon_index = 4
-        violation = (max(0, self.ns_history[-1][Vcon_index] - 800)) * (420/800)
-        #violation = (max(0, self.ns_history[-1][Vcon_index] - 800)) * (self.v1_q/800)
-        if violation > 0:
-            violation *= self.config.v_c
+        #violation = (max(0, self.ns_history[-1][Vcon_index] - 800)) * (420/800)
+        violation = (max(0, self.ns_history[-1][Vcon_index] - 800)) * (self.v1_q/800)
+        
+        #if violation > 0:
+        #    violation *= self.config.v_c
         return violation
 
     #######################################
@@ -811,29 +829,29 @@ class experiment(object):
     def violations_prefill(self, state):
         Tcon_index = int(3)
         Vcon_index = 4
-        violation = (state[Tcon_index] - 420) + (max(state[Vcon_index] - 800, 0))\
-            *(420/800)
+        #violation = (state[Tcon_index] - 420) + (max(state[Vcon_index] - 800, 0))\
+        #    *(420/800)
         #learning tighter
-        #violation = (state[Tcon_index] - self.v1_q + (max(state[Vcon_index] - 800, 0))\
-        #    *(self.v1_q/800))
-        if violation > 0:
-            violation *= self.config.v_c
+        violation = (state[Tcon_index] - self.v1_q + (max(state[Vcon_index] - 800, 0))\
+            *(self.v1_q/800))
+        #if violation > 0:
+        #    violation *= self.config.v_c
         return violation
 
     def violation1_prefill(self, state):
         Tcon_index = int(3)
-        violation = (state[Tcon_index] - 420)
-        #violation = max(0, (state[Tcon_index] - self.v1_q))
+        #violation = (state[Tcon_index] - 420)
+        violation = max(0, (state[Tcon_index] - self.v1_q))
         #if violation > 0:
         #    violation *= self.config.v_c
         return violation
 
     def violation2_prefill(self, state):
         Vcon_index = 4
-        violation = (max(state[Vcon_index] - 800, 0)) * (420/800)
-        #violation = (max(state[Vcon_index] - 800, 0)) * (self.v1_q/800)        #only leraning tighter the temperature constraint
+        #violation = (max(state[Vcon_index] - 800, 0)) * (420/800)
+        violation = (max(state[Vcon_index] - 800, 0)) * (self.v1_q/800)        #only leraning tighter the temperature constraint
         #if violation > 0:
-        #    violation *= 3
+            #violation *= self.config.v_c
         return violation
 
 
@@ -900,6 +918,8 @@ class experiment(object):
             else:
                 #print("new training")
                 self.new_training_step()
+            #if i % self.config.val_iter_freq == 0:
+            #    self.validation_iter()
         return
 
     def get_train_inputs(self, model):
@@ -924,11 +944,22 @@ class experiment(object):
             print('Validation epoch: {}'.format(self.training_iter))
             state = self.env.reset()
             for i in range(self.env.steps - 1):         #control steps are 1 less than training steps
-                action = self.best_action(state, self.models[i], self.con_models[i], self.con_models2[i], validation=True)
+                action = self.best_action(state, self.models[i+1], self.con_models[i+1], self.con_models2[i+1], validation=True)
                 ns, r, t_step = self.env.transition(state, action)
                 self.models[i].add_val_result(state, action)    #add new training inputsx
                 state = ns
-        return 
+        return
+
+    #TO BE USED WITH COLAB AND TENSORBOARD
+    #def validation_iter(self):
+    #    print('Validation epoch: {}'.format(self.training_iter))
+    #    state = self.env.reset()
+    #    for i in range(self.env.steps - 1):         #control steps are 1 less than training steps
+    #        action = self.best_action(state, self.models[i+1], self.con_models[i+1], self.con_models2[i+1], validation=True)
+    #        ns, r, t_step = self.env.transition(state, action)
+    #        self.writer.add_scalar("Validation Temperature", state[3] , i)
+    #        state = ns
+    #    return 
 
     def get_var_data(self):
         data = np.zeros((len(self.models), len(self.models[-1].data_variance)))
