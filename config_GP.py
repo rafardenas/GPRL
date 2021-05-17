@@ -13,7 +13,7 @@ class configGP():
     pre_filling_iters = 20
     
     #training
-    training_iter     = 20
+    training_iter     = 5
     
     #alpha
     alp_begin         = 10
@@ -32,7 +32,7 @@ class configGP():
     bet_rate          = - iter_end / np.log(bet_end/bet_begin)
     
     #increased penalty over constraint violation
-    v_c               = 20000    
+    v_c               = 1    
     #1. constraint limit
     v1_q              = 420           
     save              = True

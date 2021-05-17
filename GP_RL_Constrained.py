@@ -112,6 +112,7 @@ class GP_agent():
         self.config = config
         self.curr_variance      = 0
         self.curr_con_variance  = 0
+        self.valid_results = []
     
     def normalize_x(self, X):
         "Normalize X for the GPs"
@@ -777,8 +778,9 @@ class experiment(object):
             #print("Real violation normalized:", self.con_models[i].normalize_y(self.violation1(self.ns_history[i])))
             state = self.ns_history[i]
 
-        if self.training_iter == 20:  
+        if self.training_iter == 5:  
             print("Inputs GP: ", self.models[2].inputs) 
+            print("Outputs GP: ", self.models[2].outputs) 
             print(self.models[2].core[''])
 
         self.error_vio.append(tr_eps_vio_error / i)
